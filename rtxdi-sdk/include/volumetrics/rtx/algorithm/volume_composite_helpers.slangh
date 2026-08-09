@@ -131,6 +131,7 @@ void integrateVolumetricNEE(
   const float3 targetVector = targetPositionTranslated - startPositionTranslated;
 
   float3 previousTranslatedWorldPosition = startPositionTranslated;
+  float3 lastInScatter = volumeArgs.multiScatteringEstimate;
 
   // Perform the integration
   for (uint z = 0; z < numSteps; z++)
@@ -187,13 +188,41 @@ void integrateVolumetricNEE(
     const float3 physicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(virtualFroxelUVW, currentFroxelVolume, volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU, volumeArgs.inverseNumFroxelVolumes);
     
     const SphericalHarmonic sh = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(volumeFilteredRadianceY, volumeFilteredRadianceCoCg, physicalFroxelUVW);
-    
-    const float3 accumulatedRadianceSample = sh.evaluateHenyeyGreenstein(viewDir, volumeArgs.volumetricFogAnisotropy);
-    
-    const float3 inScattering = accumulatedRadianceSample + volumeArgs.multiScatteringEstimate;
-    const float3 outScattering = volumeArgs.scatteringCoefficient * density;
+
+    // fogSunVisibilityGain scales only the anisotropic excess over isotropic SH.
+    const float3 isotropicRadiance = sh.evaluateHenyeyGreenstein(viewDir, 0.0f);
+    const float3 directionalRadiance = sh.evaluateHenyeyGreenstein(viewDir, volumeArgs.volumetricFogAnisotropy);
+    const float3 accumulatedRadianceSample = isotropicRadiance
+      + (directionalRadiance - isotropicRadiance) * volumeArgs.fogSunVisibilityGain;
+
+    float3 lighting = accumulatedRadianceSample + volumeArgs.multiScatteringEstimate;
+    float3 scatterCoeff = volumeArgs.scatteringCoefficient;
+
+    // Low-sun: desaturate σ_s, mild warm bias, luminance-match (keeps cool media realistic).
+    if (volumeArgs.fogSunsetColorBlend > 0.0f)
+    {
+      const float b = saturate(volumeArgs.fogSunsetColorBlend);
+      const float sLum = max(calcBt709Luminance(volumeArgs.scatteringCoefficient), 1e-6f);
+      scatterCoeff = lerp(volumeArgs.scatteringCoefficient, float3(sLum, sLum, sLum), saturate(b * 1.25f));
+
+      float3 litScatter = lighting * scatterCoeff;
+      const float3 warmMul = lerp(float3(1.0f, 1.0f, 1.0f), volumeArgs.fogSunsetWarmTint, b * 0.35f);
+      const float3 warmed = litScatter * warmMul;
+      const float lum0 = calcBt709Luminance(lighting * volumeArgs.scatteringCoefficient);
+      const float lum1 = max(calcBt709Luminance(warmed), 1e-6f);
+      litScatter = warmed * (lum0 / lum1);
+
+      const float gCap = max(litScatter.x, litScatter.z) * 1.02f;
+      litScatter.y = lerp(litScatter.y, min(litScatter.y, gCap), b);
+
+      lighting = litScatter / max(sLum, 1e-6f);
+      scatterCoeff = float3(sLum, sLum, sLum);
+    }
+
+    lastInScatter = lighting;
+    const float3 outScattering = scatterCoeff * density;
   
-    preintegratedRadiance += inScattering * outScattering * accumulatedTransmittance * stepSize ;
+    preintegratedRadiance += lighting * outScattering * accumulatedTransmittance * stepSize ;
     accumulatedTransmittance *= calcVolumetricAttenuation(volumeArgs, camera, false, stepSize, previousTranslatedWorldPosition, viewDir, density);
 
     // Set the previous world position
@@ -201,15 +230,29 @@ void integrateVolumetricNEE(
     previousTranslatedWorldPosition = currentTranslatedWorldPosition;
   }
   
-  // Since volumetrics are only calculated for a fraction of the frustum volume, we need to calculate the remaining attenuation assuming homogonous media
-  // starting at the last translated world position the integration steps ended on (previousTranslatedWorldPosition).
-  // This handles both the large hit distance case, and the miss case which do require separate solutions.
-  if (primaryMiss)
+  // Beyond the froxel grid: Beer + homogeneous in-scatter from last froxel lighting.
+  // lastInScatter already includes multiScatteringEstimate.
+  if (primaryMiss || hitDistance > volumeArgs.froxelMaxDistance)
   {
-    accumulatedTransmittance *= calcVolumetricAttenuation(volumeArgs, camera, true, 0.f, previousTranslatedWorldPosition, viewDir);
-  }
-  else if(hitDistance > volumeArgs.froxelMaxDistance)
-  {
-    accumulatedTransmittance *= calcVolumetricAttenuation(volumeArgs, camera, false, hitDistance - volumeArgs.froxelMaxDistance, previousTranslatedWorldPosition, viewDir);
+    const bool infiniteTail = primaryMiss;
+    const float remainDistance = infiniteTail
+      ? 0.f
+      : max(hitDistance - volumeArgs.froxelMaxDistance, 0.f);
+    if (infiniteTail || remainDistance > 0.f)
+    {
+      const float3 remainT = calcVolumetricAttenuation(
+        volumeArgs, camera, infiniteTail, remainDistance, previousTranslatedWorldPosition, viewDir);
+      float3 singleScatterAlbedo = volumeArgs.scatteringCoefficient
+        / max(volumeArgs.attenuationCoefficient, float3(1e-6f, 1e-6f, 1e-6f));
+      if (volumeArgs.fogSunsetColorBlend > 0.0f)
+      {
+        const float b = saturate(volumeArgs.fogSunsetColorBlend);
+        const float aLum = max(calcBt709Luminance(singleScatterAlbedo), 1e-6f);
+        singleScatterAlbedo = lerp(singleScatterAlbedo, float3(aLum, aLum, aLum), saturate(b * 1.25f));
+      }
+      preintegratedRadiance += lastInScatter * singleScatterAlbedo
+                             * (float3(1.0f, 1.0f, 1.0f) - remainT) * accumulatedTransmittance;
+      accumulatedTransmittance *= remainT;
+    }
   }
 }

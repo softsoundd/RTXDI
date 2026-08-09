@@ -70,7 +70,29 @@ float3 calcVolumetricAttenuation(
 
     const float attenuationT = infinitelyDistant ? volumeArgs.maxAttenuationDistanceForNoAtmosphere : min(volumeArgs.maxAttenuationDistanceForNoAtmosphere, hitDistance);
 
-    return evalBeerLambertAttenuation(volumeArgs.attenuationCoefficient * attenuationScalar, attenuationT);
+    // Height above planet surface (matches atmosphere path — not world origin).
+    float opticalPath = attenuationT;
+    if (volumeArgs.fogDensityScaleHeight > 0.0f && attenuationT > 0.0f)
+    {
+      const float3 planetCenter = calcPlanetCenter(volumeArgs, camera);
+      const float atmosphereRadius = sqrt(max(volumeArgs.atmosphereRadiusSquared, 0.0f));
+      const float planetRadius = max(atmosphereRadius - volumeArgs.atmosphereHeight, 0.0f);
+      const float H = volumeArgs.fogDensityScaleHeight;
+      const uint kSamples = 8;
+      const float dt = attenuationT / float(kSamples);
+      opticalPath = 0.0f;
+      float rhoPrev = exp(-max(length(origin - planetCenter) - planetRadius, 0.0f) / H);
+      [unroll]
+      for (uint i = 1; i <= kSamples; ++i)
+      {
+        const float3 p = origin + direction * (dt * float(i));
+        const float rho = exp(-max(length(p - planetCenter) - planetRadius, 0.0f) / H);
+        opticalPath += 0.5f * (rhoPrev + rho) * dt;
+        rhoPrev = rho;
+      }
+    }
+
+    return evalBeerLambertAttenuation(volumeArgs.attenuationCoefficient * attenuationScalar, opticalPath);
   }
   else
   {
@@ -133,7 +155,28 @@ float evalAtmosphericDensityBetween(
 
   const float3 planetCenter = calcPlanetCenter(volumeArgs, camera);
 
-  return lineSegmentSphereIntersectionPercentage(p1, p2, planetCenter, volumeArgs.atmosphereRadiusSquared);
+  float shellFraction = lineSegmentSphereIntersectionPercentage(p1, p2, planetCenter, volumeArgs.atmosphereRadiusSquared);
+  if (shellFraction <= 0.f)
+  {
+    return 0.f;
+  }
+
+  // Height falloff: trapezoid mean of ρ(h)=exp(-h/H) along the segment.
+  if (volumeArgs.fogDensityScaleHeight > 0.f)
+  {
+    const float atmosphereRadius = sqrt(max(volumeArgs.atmosphereRadiusSquared, 0.f));
+    const float planetRadius = max(atmosphereRadius - volumeArgs.atmosphereHeight, 0.f);
+    const float H = volumeArgs.fogDensityScaleHeight;
+    const float3 mid = 0.5f * (p1 + p2);
+    const float h0 = length(p1 - planetCenter) - planetRadius;
+    const float h1 = length(mid - planetCenter) - planetRadius;
+    const float h2 = length(p2 - planetCenter) - planetRadius;
+    const float heightFactor =
+      (exp(-max(h0, 0.f) / H) + 2.0f * exp(-max(h1, 0.f) / H) + exp(-max(h2, 0.f) / H)) * 0.25f;
+    shellFraction *= heightFactor;
+  }
+
+  return shellFraction;
 }
 
 // Calculates the attenuation resulting from the volumetric system (global fog or the atmosphere) on a specified ray.
@@ -208,7 +251,34 @@ float3 calcAtmosphereAttenuation(
     }
   }
 
-  return evalBeerLambertAttenuation(volumeArgs.attenuationCoefficient * attenuationScalar, attenuationT);
+  // Height falloff: trapezoid mean of ρ(h)=exp(-h/H) along the atmospheric segment.
+  float opticalPath = attenuationT;
+  if (volumeArgs.fogDensityScaleHeight > 0.0f && attenuationT > 0.0f)
+  {
+    const float atmosphereRadius = sqrt(max(volumeArgs.atmosphereRadiusSquared, 0.0f));
+    const float planetRadius = max(atmosphereRadius - volumeArgs.atmosphereHeight, 0.0f);
+    const float H = volumeArgs.fogDensityScaleHeight;
+    float tEnter = 0.0f;
+    if (!inAtmosphere)
+    {
+      tEnter = atmosphereEntryHitT;
+    }
+    const uint kSamples = 8;
+    const float dt = attenuationT / float(kSamples);
+    opticalPath = 0.0f;
+    float3 p = origin + direction * tEnter;
+    float rhoPrev = exp(-max(length(p - planetCenter) - planetRadius, 0.0f) / H);
+    [unroll]
+    for (uint i = 1; i <= kSamples; ++i)
+    {
+      p = origin + direction * (tEnter + dt * float(i));
+      const float rho = exp(-max(length(p - planetCenter) - planetRadius, 0.0f) / H);
+      opticalPath += 0.5f * (rhoPrev + rho) * dt;
+      rhoPrev = rho;
+    }
+  }
+
+  return evalBeerLambertAttenuation(volumeArgs.attenuationCoefficient * attenuationScalar, opticalPath);
 }
 
 // Calculates a volumetric density modulation factor between two points based on a configurable noise function.
