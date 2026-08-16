@@ -27,6 +27,36 @@
 
 // Volume Integrate Helper Functions
 
+// Transmittance from a froxel toward the sky along dirWorld, zero when occluded. Without this the
+// sky-view LUT hemisphere is injected into every froxel regardless of geometry, which leaks outdoor
+// sky radiance into interiors - most visibly onto translucent surfaces, whose diffuse layer reads
+// the froxel cache directly through approximateDiffuseLayerRadiance.
+vec3 evalFroxelSkyVisibility(
+  vec3 dirWorld, Ray viewRay, MinimalRayInteraction minimalRayInteraction, VolumeInteraction volumeInteraction)
+{
+  // Far enough to escape any level geometry, matching the distant light convention.
+  const vec3 targetPosition = volumeInteraction.position + dirWorld * 100000.0f;
+  const Ray visibilityRay = rayCreatePosition(
+    minimalRayInteraction, volumeInteraction, viewRay, targetPosition);
+
+  // Note: evalVolumeNEEVisibility only reads the ray, but takes a light sample for interface parity.
+  LightSample skyLightSample;
+  skyLightSample.position = targetPosition;
+  skyLightSample.normal = -dirWorld;
+  skyLightSample.radiance = vec3(0.0f, 0.0f, 0.0f);
+  skyLightSample.solidAnglePdf = 1.0f;
+
+  const VisibilityResult visibility = evalVolumeNEEVisibility(
+    skyLightSample, invalidRayPortalIndex, visibilityRay);
+
+  if (visibility.hasOpaqueHit)
+  {
+    return vec3(0.0f, 0.0f, 0.0f);
+  }
+
+  return vec3(visibility.attenuation);
+}
+
 // Todo: Find some way to unify this with the normal Integrator's evalNEE function some day. Not ideal to duplicate code like this.
 bool evalNEE(
   inout vec3 radiance,
@@ -90,8 +120,8 @@ bool evalNEE(
       const float hWorld = dot(volumeInteraction.position - camPos, volumeArgs.sceneUpDirection);
       altitudeKm += max(hWorld, 0.0f) / (wupm * 1000.0f);
     }
-    const vec3 T_h = getTransmittanceToSunAtAltitude(altitudeKm, cb.atmosphereArgs);
-    const vec3 T_0 = getTransmittanceToSunAtAltitude(cb.atmosphereArgs.viewAltitude, cb.atmosphereArgs);
+    const vec3 T_h = getTransmittanceToSunAtAltitude(altitudeKm, AtmosphereTransmittanceLut, cb.atmosphereArgs);
+    const vec3 T_0 = getTransmittanceToSunAtAltitude(cb.atmosphereArgs.viewAltitude, AtmosphereTransmittanceLut, cb.atmosphereArgs);
     // Clamp so near-twilight ground T≈0 cannot blow up elevated samples.
     lightRadiance *= clamp(T_h / max(T_0, vec3(1e-6f)), vec3(0.0f), vec3(8.0f));
   }
@@ -294,120 +324,102 @@ void integrateVolume(
   }
 
   // Physical Atmosphere: sky-view LUT → froxel SH.
-  // Prefer a strong isotropic floor + few directional accents (dense opposing L1 samples cancel).
+  // Uniform Monte Carlo over the upper hemisphere with one visibility ray per sample, so interiors
+  // no longer inherit outdoor sky radiance. The SH accumulates the integral of incoming radiance
+  // over solid angle, so each sample carries radiance * (2pi / N); the resulting variance is
+  // absorbed by the froxel history blend further down.
   // Phase is applied once in composite — do not bake HG here.
   if (cb.skyMode == 1 && volumeArgs.skyAmbientStrength > 0.0f)
   {
     const bool isZUp = cb.isZUp != 0;
-    const float3 zenithYUp = float3(0.0f, 1.0f, 0.0f);
-    const float3 zenithWorld = isZUp ? float3(0.0f, 0.0f, 1.0f) : zenithYUp;
+    const float3 zenithWorld = isZUp ? float3(0.0f, 0.0f, 1.0f) : float3(0.0f, 1.0f, 0.0f);
     const float3 xWorld = float3(1.0f, 0.0f, 0.0f);
-    const float3 yWorld = isZUp ? float3(0.0f, 1.0f, 0.0f) : float3(0.0f, 0.0f, 1.0f);
     const float fireflyThreshold = volumeArgs.froxelFireflyFilteringLuminanceThreshold;
 
-    // Soft height fade so elevated froxels are less bright than street-level fog.
-    const float wupm = max(volumeArgs.worldUnitsPerMeter, 1e-6f);
-    float hWorld = 0.0f;
-    if (volumeArgs.enableAtmosphere != 0)
-    {
-      const float atmR = sqrt(max(volumeArgs.atmosphereRadiusSquared, 0.0f));
-      const float planetR = max(atmR - volumeArgs.atmosphereHeight, 0.0f);
-      hWorld = length(volumeInteraction.position - volumeArgs.planetCenter) - planetR;
-    }
-    else
-    {
-      const float3 camPos = cameraGetWorldPosition(cb.camera);
-      hWorld = dot(volumeInteraction.position - camPos, volumeArgs.sceneUpDirection);
-    }
-    const float heightFade = volumeArgs.fogDensityScaleHeight > 0.0f
-      ? exp(-max(hWorld, 0.0f) / volumeArgs.fogDensityScaleHeight)
-      : 1.0f;
-    const float skyHeightScale = lerp(1.0f, heightFade, 0.65f);
+    const uint skySampleCount = max(volumeArgs.skyVisibilitySampleCount, 1u);
+    // Uniform hemisphere pdf is 1/(2pi), so the single sample estimator weight is 2pi/N.
+    const float skySampleWeight = float(twoPi) / float(skySampleCount);
 
-    float3 skyMean = float3(0.0f, 0.0f, 0.0f);
-    float3 horizonMean = float3(0.0f, 0.0f, 0.0f);
-    const float elevMid = 0.6981317008f; // 40 deg
-    const float elevHor = 0.2094395102f; // 12 deg
-    const float ceM = cos(elevMid);
-    const float seM = sin(elevMid);
-    const float ceH = cos(elevHor);
-    const float seH = sin(elevHor);
+    // Mean visible sky radiance and how open the froxel is, both reused by the terms below.
+    float3 visibleSkyMean = float3(0.0f, 0.0f, 0.0f);
+    float skyOpenness = 0.0f;
 
-    skyMean += sampleSkyAmbientForVolume(zenithYUp, cb.atmosphereArgs, AtmosphereSkyViewLut);
-    [unroll]
-    for (uint si = 0; si < 6; ++si)
+    for (uint si = 0; si < skySampleCount; ++si)
     {
-      const float az = (6.28318530718f / 6.0f) * float(si);
-      const float3 midYUp = float3(ceM * cos(az), seM, ceM * sin(az));
-      const float3 horYUp = float3(ceH * cos(az), seH, ceH * sin(az));
-      const vec3 Lm = sampleSkyAmbientForVolume(midYUp, cb.atmosphereArgs, AtmosphereSkyViewLut);
-      const vec3 Lh = sampleSkyAmbientForVolume(horYUp, cb.atmosphereArgs, AtmosphereSkyViewLut);
-      skyMean += Lm + Lh;
-      horizonMean += Lh;
-    }
-    float3 sunYUp = float3(cb.atmosphereArgs.sunDirection.x, max(cb.atmosphereArgs.sunDirection.y, 0.05f), cb.atmosphereArgs.sunDirection.z);
-    sunYUp = normalize(sunYUp);
-    const vec3 LsunSky = sampleSkyAmbientForVolume(sunYUp, cb.atmosphereArgs, AtmosphereSkyViewLut);
-    skyMean += LsunSky;
-    skyMean *= (1.0f / 14.0f);
-    horizonMean *= (1.0f / 6.0f);
-
-    const float sunsetWarm = 1.0f - saturate(cb.atmosphereArgs.sunDirection.y / 0.35f);
-    const float horizonBias = lerp(0.35f, 0.45f, sunsetWarm);
-    vec3 skyFloor = lerp(skyMean, horizonMean, horizonBias);
-    skyFloor = lerp(skyFloor, LsunSky, 0.1f * sunsetWarm);
-    skyFloor *= skyHeightScale;
-
-    // Isotropic L00 via ±horizontals (avoid tinting the downwelling lobe). 1.5× for four-axis energy.
-    const float isoStrength = volumeArgs.skyAmbientStrength * 1.25f;
-    const vec3 iso = fireflyFiltering(skyFloor * isoStrength * 1.5f, fireflyThreshold);
-    radianceSH.addRadiance(iso, xWorld);
-    radianceSH.addRadiance(iso, -xWorld);
-    radianceSH.addRadiance(iso, yWorld);
-    radianceSH.addRadiance(iso, -yWorld);
-    radianceSH.addRadiance(iso * 0.35f, zenithWorld);
-
-    const float dirStrength = volumeArgs.skyAmbientStrength * 0.55f * skyHeightScale;
-    radianceSH.addRadiance(fireflyFiltering(sampleSkyAmbientForVolume(zenithYUp, cb.atmosphereArgs, AtmosphereSkyViewLut) * dirStrength, fireflyThreshold), zenithWorld);
-    {
-      const float3 sunWorld = isZUp ? float3(sunYUp.x, sunYUp.z, sunYUp.y) : sunYUp;
-      radianceSH.addRadiance(fireflyFiltering(LsunSky * dirStrength * 1.25f, fireflyThreshold), sunWorld);
-    }
-    [unroll]
-    for (uint si = 0; si < 4; ++si)
-    {
-      const float az = (6.28318530718f / 4.0f) * float(si) + 0.7853981634f;
-      const float3 dirYUp = float3(ceM * cos(az), seM, ceM * sin(az));
+      const float2 skyRandom = float2(RAB_GetNextRandom(rabRandomState), RAB_GetNextRandom(rabRandomState));
+      float unusedSolidAnglePdf;
+      const float3 hemisphereSample = calcUniformHemisphereDirectionSample(skyRandom, unusedSolidAnglePdf);
+      // calcUniformHemisphereDirectionSample is oriented around +Z, the sky-view LUT expects Y-up.
+      const float3 dirYUp = float3(hemisphereSample.x, hemisphereSample.z, hemisphereSample.y);
       const float3 dirWorld = isZUp ? float3(dirYUp.x, dirYUp.z, dirYUp.y) : dirYUp;
-      const vec3 L = sampleSkyAmbientForVolume(dirYUp, cb.atmosphereArgs, AtmosphereSkyViewLut) * dirStrength;
-      radianceSH.addRadiance(fireflyFiltering(L, fireflyThreshold), dirWorld);
+
+      const vec3 skyVisibility = volumeArgs.skyAmbientVisibility != 0
+        ? evalFroxelSkyVisibility(dirWorld, ray, minimalRayInteraction, volumeInteraction)
+        : vec3(1.0f, 1.0f, 1.0f);
+
+      skyOpenness += (skyVisibility.x + skyVisibility.y + skyVisibility.z) * (1.0f / 3.0f);
+
+      const vec3 skyRadiance =
+        sampleSkyAmbientForVolume(dirYUp, cb.atmosphereArgs, AtmosphereSkyViewLut) * skyVisibility;
+      visibleSkyMean += skyRadiance;
+
+      if (any(skyRadiance > 0.0f))
+      {
+        const vec3 contribution = skyRadiance * (skySampleWeight * volumeArgs.skyAmbientStrength);
+        radianceSH.addRadiance(fireflyFiltering(contribution, fireflyThreshold), dirWorld);
+      }
     }
 
+    const float invSkySampleCount = 1.0f / float(skySampleCount);
+    visibleSkyMean *= invSkySampleCount;
+    skyOpenness = saturate(skyOpenness * invSkySampleCount);
+
+    // Higher scattering orders in the medium, isotropic per the Hillaire multiscattering assumption.
     if (volumeArgs.multiScatterResidualScale > 0.0f)
     {
       const float3 albedo = volumeArgs.scatteringCoefficient
         / max(volumeArgs.attenuationCoefficient, float3(1e-6f, 1e-6f, 1e-6f));
       const float avgA = saturate((albedo.x + albedo.y + albedo.z) * (1.0f / 3.0f));
       const float msFactor = avgA / max(1.0f - 0.9f * avgA, 1e-3f);
-      const vec3 ms = fireflyFiltering(skyFloor * (volumeArgs.multiScatterResidualScale * msFactor), fireflyThreshold);
-      radianceSH.addRadiance(ms, xWorld);
-      radianceSH.addRadiance(ms, -xWorld);
-      radianceSH.addRadiance(ms, yWorld);
-      radianceSH.addRadiance(ms, -yWorld);
+      const vec3 ms = visibleSkyMean * (float(twoPi) * volumeArgs.skyAmbientStrength
+                                        * volumeArgs.multiScatterResidualScale * msFactor);
+      // Two opposing directions cancel the L1 terms, leaving a purely isotropic L00 contribution.
+      const vec3 msHalf = fireflyFiltering(ms * 0.5f, fireflyThreshold);
+      radianceSH.addRadiance(msHalf, xWorld);
+      radianceSH.addRadiance(msHalf, -xWorld);
     }
 
     // Ground bounce; fade with froxel height and soft twilight (−15°…day).
     const float kTwilightLo = -0.259f; // -15 deg
     const float kTwilightHi = 0.15f;
     const float twilightFade = smoothstep(kTwilightLo, kTwilightHi, cb.atmosphereArgs.sunDirection.y);
-    if (volumeArgs.groundBounceScale > 0.0f && twilightFade > 0.0f)
+    if (volumeArgs.groundBounceScale > 0.0f && twilightFade > 0.0f && skyOpenness > 0.0f)
     {
-      float altitudeKm = cb.atmosphereArgs.viewAltitude + max(hWorld, 0.0f) / (wupm * 1000.0f);
-      const vec3 T = getTransmittanceToSunAtAltitude(altitudeKm, cb.atmosphereArgs);
+      const float wupm = max(volumeArgs.worldUnitsPerMeter, 1e-6f);
+      float hWorld = 0.0f;
+      if (volumeArgs.enableAtmosphere != 0)
+      {
+        const float atmR = sqrt(max(volumeArgs.atmosphereRadiusSquared, 0.0f));
+        const float planetR = max(atmR - volumeArgs.atmosphereHeight, 0.0f);
+        hWorld = length(volumeInteraction.position - volumeArgs.planetCenter) - planetR;
+      }
+      else
+      {
+        const float3 camPos = cameraGetWorldPosition(cb.camera);
+        hWorld = dot(volumeInteraction.position - camPos, volumeArgs.sceneUpDirection);
+      }
+      // Upward bounce is attenuated by the medium it climbs through.
+      const float heightFade = volumeArgs.fogDensityScaleHeight > 0.0f
+        ? exp(-max(hWorld, 0.0f) / volumeArgs.fogDensityScaleHeight)
+        : 1.0f;
+
+      const float altitudeKm = cb.atmosphereArgs.viewAltitude + max(hWorld, 0.0f) / (wupm * 1000.0f);
+      const vec3 T = getTransmittanceToSunAtAltitude(altitudeKm, AtmosphereTransmittanceLut, cb.atmosphereArgs);
       const float3 groundAlbedo = float3(0.45f, 0.45f, 0.45f);
+      // Reuse sky openness: indoors the sun cannot reach the ground under the froxel either.
       const vec3 bounce = cb.atmosphereArgs.sunIlluminance * T * cb.atmosphereArgs.sunRayBrightness
                         * groundAlbedo * (1.0f / 3.14159265f)
-                        * volumeArgs.groundBounceScale * heightFade * twilightFade;
+                        * volumeArgs.groundBounceScale * heightFade * twilightFade * skyOpenness;
       radianceSH.addRadiance(fireflyFiltering(bounce, fireflyThreshold), -zenithWorld);
     }
   }
