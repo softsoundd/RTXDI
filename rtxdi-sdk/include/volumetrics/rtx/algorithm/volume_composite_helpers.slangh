@@ -57,6 +57,10 @@ float getRayPortalIntersection(float3 origin, float3 direction, RayPortalHitInfo
   return -1.0;
 }
 
+// Width, in froxel UVW, of the band over which the off-frustum fallback fades in. Wide enough to hide
+// the transition, narrow enough that samples well inside the grid are untouched.
+static const float kFroxelFallbackFadeWidth = 0.08f;
+
 // The froxel cache only covers the camera frustum, so a ray that leaves it (a PSR reflection or a
 // transmitted ray, for instance) would otherwise have its lighting clamped to whatever sits at the
 // screen edge, which can pull a sun shaft from the edge of the screen into a reflection facing away
@@ -160,10 +164,19 @@ void integrateVolumetricNEE(
                                       volumeArgs.froxelDepthSlices, volumeArgs.froxelDepthSliceDistributionExponent, volumeArgs.froxelMaxDistance, camera.nearPlane,
                                       currentTranslatedWorldPosition);
 
-    // Outside the grid the sampler would clamp to an edge froxel. A position behind the camera is
-    // caught too, since its negative view Z drives the depth slice negative.
-    const bool froxelValid = all(virtualFroxelUVW > vec3(0.0f, 0.0f, 0.0f)) && all(virtualFroxelUVW < vec3(1.0f, 1.0f, 1.0f));
-    const bool useFallback = useOffFrustumFallback && !froxelValid;
+    // Outside the grid the sampler would clamp to an edge froxel. Blend toward the caller's substitute
+    // across a narrow band rather than switching at the boundary: a hard switch leaves a seam running
+    // down the image wherever a ray crosses out of the frustum, since the substitute carries only
+    // ambient while the cache also holds sun shafts and local lights. Near the edge the clamped sample
+    // is still close to the true edge value, so blending there is harmless.
+    // A position behind the camera is caught too, since its negative view Z drives the slice negative.
+    const vec3 uvwOutside = max(
+      max(-virtualFroxelUVW, virtualFroxelUVW - vec3(1.0f, 1.0f, 1.0f)),
+      vec3(0.0f, 0.0f, 0.0f));
+    const float outsideAmount = max(max(uvwOutside.x, uvwOutside.y), uvwOutside.z);
+    const float fallbackWeight = useOffFrustumFallback
+      ? saturate(outsideAmount / kFroxelFallbackFadeWidth)
+      : 0.0f;
 
     // Use the age as a guide for filtering, Larger footprint for early samples
     
@@ -200,7 +213,7 @@ void integrateVolumetricNEE(
     const float3 physicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(virtualFroxelUVW, currentFroxelVolume, volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU, volumeArgs.inverseNumFroxelVolumes);
 
     float3 accumulatedRadianceSample;
-    if (useFallback)
+    if (fallbackWeight >= 1.0f)
     {
       accumulatedRadianceSample = offFrustumInScatter;
     }
@@ -211,8 +224,10 @@ void integrateVolumetricNEE(
       // fogSunVisibilityGain scales only the anisotropic excess over isotropic SH.
       const float3 isotropicRadiance = sh.evaluateHenyeyGreenstein(viewDir, 0.0f);
       const float3 directionalRadiance = sh.evaluateHenyeyGreenstein(viewDir, volumeArgs.volumetricFogAnisotropy);
-      accumulatedRadianceSample = isotropicRadiance
+      const float3 froxelRadiance = isotropicRadiance
         + (directionalRadiance - isotropicRadiance) * volumeArgs.fogSunVisibilityGain;
+
+      accumulatedRadianceSample = lerp(froxelRadiance, offFrustumInScatter, fallbackWeight);
     }
 
     float3 lighting = accumulatedRadianceSample + volumeArgs.multiScatteringEstimate;
