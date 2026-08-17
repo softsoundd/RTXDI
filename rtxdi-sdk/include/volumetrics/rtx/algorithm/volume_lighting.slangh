@@ -139,7 +139,8 @@ bool isInAtmosphere(
   return dot(relPos, relPos) <= volumeArgs.atmosphereRadiusSquared;
 }
 
-// Calculates the percentage of a line segment below an axis-aligned plane.
+// Mean density along a line segment: the fraction of it inside the atmosphere shell times the mean of the
+// exponential height falloff over it. Callers scaling coefficients by this must not apply the falloff again.
 // The start and end positions must be in the same translated world space as the volume camera passed in,
 // or world space if no camera is passed in.
 float evalAtmosphericDensityBetween(
@@ -148,17 +149,19 @@ float evalAtmosphericDensityBetween(
   const float3 p1, const float3 p2
 )
 {
-  if (!volumeArgs.enableAtmosphere)
-  {
-    return 1.f;
-  }
-
   const float3 planetCenter = calcPlanetCenter(volumeArgs, camera);
 
-  float shellFraction = lineSegmentSphereIntersectionPercentage(p1, p2, planetCenter, volumeArgs.atmosphereRadiusSquared);
-  if (shellFraction <= 0.f)
+  // No shell to clip against, but the height falloff below still applies: calcVolumetricAttenuation's
+  // no-atmosphere path measures height against this same planet surface.
+  float shellFraction = 1.f;
+
+  if (volumeArgs.enableAtmosphere)
   {
-    return 0.f;
+    shellFraction = lineSegmentSphereIntersectionPercentage(p1, p2, planetCenter, volumeArgs.atmosphereRadiusSquared);
+    if (shellFraction <= 0.f)
+    {
+      return 0.f;
+    }
   }
 
   // Height falloff: trapezoid mean of ρ(h)=exp(-h/H) along the segment.

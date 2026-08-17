@@ -57,14 +57,25 @@ float getRayPortalIntersection(float3 origin, float3 direction, RayPortalHitInfo
   return -1.0;
 }
 
+// outMeanInScatter receives the step-length weighted mean of the in-scatter read from the froxel radiance
+// cache, or zero when useUniformInScatter skipped the cache.
+//
+// useUniformInScatter lights every step from a single value instead of the cache. The cache covers only the
+// camera's frustum; outside it the clamps in virtualFroxelUVWToPhysicalFroxelUVW and in the sampler return
+// an unrelated edge froxel. The fraction of a non-camera ray lying inside the frustum varies with viewing
+// angle, so mixing cache lookups with a substitute makes the result depend on camera orientation.
 void integrateVolumetricNEE(
   inout RNG randomState,
   Sampler3D<float> volumeFilteredRadianceAge, Sampler3D<float4> volumeFilteredRadianceY, Sampler3D<float2> volumeFilteredRadianceCoCg,
   const VolumeArgs volumeArgs, const float timeMS,
   const uint2 pixelCoordinate, float2 screenUV, bool primaryMiss,
   float3 startPosition, const float hitDistance, const float3 viewDir,
-  inout float3 preintegratedRadiance, inout float3 accumulatedTransmittance)
+  inout float3 preintegratedRadiance, inout float3 accumulatedTransmittance,
+  out float3 outMeanInScatter,
+  bool useUniformInScatter = false, float3 uniformInScatter = vec3(0.0f, 0.0f, 0.0f))
 {
+  outMeanInScatter = vec3(0.0f, 0.0f, 0.0f);
+
   // Check if the global volumetrics are enabled
   // Note: This ensures inscattering is not read and light is not attenuated by the global volumetric medium when
   // it's not desired.
@@ -133,6 +144,10 @@ void integrateVolumetricNEE(
   float3 previousTranslatedWorldPosition = startPositionTranslated;
   float3 lastInScatter = volumeArgs.multiScatteringEstimate;
 
+  // Step length weighted so a nonlinear step distribution does not bias the mean toward the near steps.
+  float3 meanInScatterSum = vec3(0.0f, 0.0f, 0.0f);
+  float meanInScatterWeight = 0.0f;
+
   // Perform the integration
   for (uint z = 0; z < numSteps; z++)
   {
@@ -152,13 +167,16 @@ void integrateVolumetricNEE(
                                       camera.translatedWorldToView, camera.translatedWorldToProjectionJittered, packedFlagGet(camera.flags, rightHandedFlag),
                                       volumeArgs.froxelDepthSlices, volumeArgs.froxelDepthSliceDistributionExponent, volumeArgs.froxelMaxDistance, camera.nearPlane,
                                       currentTranslatedWorldPosition);
-    
-    // Use the age as a guide for filtering, Larger footprint for early samples
-    
-    const float3 centerPhysicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(virtualFroxelUVW, currentFroxelVolume, volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU, volumeArgs.inverseNumFroxelVolumes);
-    const float age = volumeFilteredRadianceAge.SampleLevel(centerPhysicalFroxelUVW, 0);
-    const float filterKernel = lerp(1.5f, 15.f, saturate(1.f - age));
-    virtualFroxelUVW = calculateJitteredFroxelUvw(volumeArgs, virtualFroxelUVW, filterKernel);
+
+    if (!useUniformInScatter)
+    {
+      // Use the age as a guide for filtering, Larger footprint for early samples
+
+      const float3 centerPhysicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(virtualFroxelUVW, currentFroxelVolume, volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU, volumeArgs.inverseNumFroxelVolumes);
+      const float age = volumeFilteredRadianceAge.SampleLevel(centerPhysicalFroxelUVW, 0);
+      const float filterKernel = lerp(1.5f, 15.f, saturate(1.f - age));
+      virtualFroxelUVW = calculateJitteredFroxelUvw(volumeArgs, virtualFroxelUVW, filterKernel);
+    }
     
     // See if the ray has crossed a portal
     if (currentFroxelDistance > portalIntersectionT && portalIntersectionT > 0)
@@ -184,16 +202,28 @@ void integrateVolumetricNEE(
     ); 
     
     // Calculate new radiance for this marching step
-    
-    const float3 physicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(virtualFroxelUVW, currentFroxelVolume, volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU, volumeArgs.inverseNumFroxelVolumes);
-    
-    const SphericalHarmonic sh = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(volumeFilteredRadianceY, volumeFilteredRadianceCoCg, physicalFroxelUVW);
 
-    // fogSunVisibilityGain scales only the anisotropic excess over isotropic SH.
-    const float3 isotropicRadiance = sh.evaluateHenyeyGreenstein(viewDir, 0.0f);
-    const float3 directionalRadiance = sh.evaluateHenyeyGreenstein(viewDir, volumeArgs.volumetricFogAnisotropy);
-    const float3 accumulatedRadianceSample = isotropicRadiance
-      + (directionalRadiance - isotropicRadiance) * volumeArgs.fogSunVisibilityGain;
+    float3 accumulatedRadianceSample;
+
+    if (useUniformInScatter)
+    {
+      accumulatedRadianceSample = uniformInScatter;
+    }
+    else
+    {
+      const float3 physicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(virtualFroxelUVW, currentFroxelVolume, volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU, volumeArgs.inverseNumFroxelVolumes);
+
+      const SphericalHarmonic sh = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(volumeFilteredRadianceY, volumeFilteredRadianceCoCg, physicalFroxelUVW);
+
+      // fogSunVisibilityGain scales only the anisotropic excess over isotropic SH.
+      const float3 isotropicRadiance = sh.evaluateHenyeyGreenstein(viewDir, 0.0f);
+      const float3 directionalRadiance = sh.evaluateHenyeyGreenstein(viewDir, volumeArgs.volumetricFogAnisotropy);
+      accumulatedRadianceSample = isotropicRadiance
+        + (directionalRadiance - isotropicRadiance) * volumeArgs.fogSunVisibilityGain;
+
+      meanInScatterSum += accumulatedRadianceSample * stepSize;
+      meanInScatterWeight += stepSize;
+    }
 
     float3 lighting = accumulatedRadianceSample + volumeArgs.multiScatteringEstimate;
     float3 scatterCoeff = volumeArgs.scatteringCoefficient;
@@ -223,11 +253,19 @@ void integrateVolumetricNEE(
     const float3 outScattering = scatterCoeff * density;
   
     preintegratedRadiance += lighting * outScattering * accumulatedTransmittance * stepSize ;
-    accumulatedTransmittance *= calcVolumetricAttenuation(volumeArgs, camera, false, stepSize, previousTranslatedWorldPosition, viewDir, density);
+    // Not via calcVolumetricAttenuation: density already carries the exp(-h/H) falloff, which that function
+    // would apply a second time, leaving extinction quadratic in density while the in-scatter above is
+    // linear in it.
+    accumulatedTransmittance *= evalBeerLambertAttenuation(volumeArgs.attenuationCoefficient * density, stepSize);
 
     // Set the previous world position
 
     previousTranslatedWorldPosition = currentTranslatedWorldPosition;
+  }
+
+  if (meanInScatterWeight > 0.0f)
+  {
+    outMeanInScatter = meanInScatterSum / meanInScatterWeight;
   }
   
   // Beyond the froxel grid: Beer + homogeneous in-scatter from last froxel lighting.
