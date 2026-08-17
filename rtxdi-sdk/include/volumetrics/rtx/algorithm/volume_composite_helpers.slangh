@@ -57,13 +57,20 @@ float getRayPortalIntersection(float3 origin, float3 direction, RayPortalHitInfo
   return -1.0;
 }
 
+// The froxel cache only covers the camera frustum, so a ray that leaves it (a PSR reflection or a
+// transmitted ray, for instance) would otherwise have its lighting clamped to whatever sits at the
+// screen edge, which can pull a sun shaft from the edge of the screen into a reflection facing away
+// from the sun. Callers integrating such a ray set useOffFrustumFallback and supply the in-scattered
+// radiance to use instead on any step that lands outside the grid. Since the march direction is
+// constant, that value only needs evaluating once. Extinction is analytic and needs no fallback.
 void integrateVolumetricNEE(
   inout RNG randomState,
   Sampler3D<float> volumeFilteredRadianceAge, Sampler3D<float4> volumeFilteredRadianceY, Sampler3D<float2> volumeFilteredRadianceCoCg,
   const VolumeArgs volumeArgs, const float timeMS,
   const uint2 pixelCoordinate, float2 screenUV, bool primaryMiss,
   float3 startPosition, const float hitDistance, const float3 viewDir,
-  inout float3 preintegratedRadiance, inout float3 accumulatedTransmittance)
+  inout float3 preintegratedRadiance, inout float3 accumulatedTransmittance,
+  bool useOffFrustumFallback = false, float3 offFrustumInScatter = float3(0.0f, 0.0f, 0.0f))
 {
   // Check if the global volumetrics are enabled
   // Note: This ensures inscattering is not read and light is not attenuated by the global volumetric medium when
@@ -152,7 +159,12 @@ void integrateVolumetricNEE(
                                       camera.translatedWorldToView, camera.translatedWorldToProjectionJittered, packedFlagGet(camera.flags, rightHandedFlag),
                                       volumeArgs.froxelDepthSlices, volumeArgs.froxelDepthSliceDistributionExponent, volumeArgs.froxelMaxDistance, camera.nearPlane,
                                       currentTranslatedWorldPosition);
-    
+
+    // Outside the grid the sampler would clamp to an edge froxel. A position behind the camera is
+    // caught too, since its negative view Z drives the depth slice negative.
+    const bool froxelValid = all(virtualFroxelUVW > vec3(0.0f, 0.0f, 0.0f)) && all(virtualFroxelUVW < vec3(1.0f, 1.0f, 1.0f));
+    const bool useFallback = useOffFrustumFallback && !froxelValid;
+
     // Use the age as a guide for filtering, Larger footprint for early samples
     
     const float3 centerPhysicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(virtualFroxelUVW, currentFroxelVolume, volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU, volumeArgs.inverseNumFroxelVolumes);
@@ -186,14 +198,22 @@ void integrateVolumetricNEE(
     // Calculate new radiance for this marching step
     
     const float3 physicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(virtualFroxelUVW, currentFroxelVolume, volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU, volumeArgs.inverseNumFroxelVolumes);
-    
-    const SphericalHarmonic sh = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(volumeFilteredRadianceY, volumeFilteredRadianceCoCg, physicalFroxelUVW);
 
-    // fogSunVisibilityGain scales only the anisotropic excess over isotropic SH.
-    const float3 isotropicRadiance = sh.evaluateHenyeyGreenstein(viewDir, 0.0f);
-    const float3 directionalRadiance = sh.evaluateHenyeyGreenstein(viewDir, volumeArgs.volumetricFogAnisotropy);
-    const float3 accumulatedRadianceSample = isotropicRadiance
-      + (directionalRadiance - isotropicRadiance) * volumeArgs.fogSunVisibilityGain;
+    float3 accumulatedRadianceSample;
+    if (useFallback)
+    {
+      accumulatedRadianceSample = offFrustumInScatter;
+    }
+    else
+    {
+      const SphericalHarmonic sh = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(volumeFilteredRadianceY, volumeFilteredRadianceCoCg, physicalFroxelUVW);
+
+      // fogSunVisibilityGain scales only the anisotropic excess over isotropic SH.
+      const float3 isotropicRadiance = sh.evaluateHenyeyGreenstein(viewDir, 0.0f);
+      const float3 directionalRadiance = sh.evaluateHenyeyGreenstein(viewDir, volumeArgs.volumetricFogAnisotropy);
+      accumulatedRadianceSample = isotropicRadiance
+        + (directionalRadiance - isotropicRadiance) * volumeArgs.fogSunVisibilityGain;
+    }
 
     float3 lighting = accumulatedRadianceSample + volumeArgs.multiScatteringEstimate;
     float3 scatterCoeff = volumeArgs.scatteringCoefficient;
