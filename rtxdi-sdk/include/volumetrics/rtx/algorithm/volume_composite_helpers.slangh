@@ -57,13 +57,86 @@ float getRayPortalIntersection(float3 origin, float3 direction, RayPortalHitInfo
   return -1.0;
 }
 
-// outMeanInScatter receives the step-length weighted mean of the in-scatter read from the froxel radiance
-// cache, or zero when useUniformInScatter skipped the cache.
-//
-// useUniformInScatter lights every step from a single value instead of the cache. The cache covers only the
-// camera's frustum; outside it the clamps in virtualFroxelUVWToPhysicalFroxelUVW and in the sampler return
-// an unrelated edge froxel. The fraction of a non-camera ray lying inside the frustum varies with viewing
-// angle, so mixing cache lookups with a substitute makes the result depend on camera orientation.
+float3 evalFroxelCacheInScatter(
+  Sampler3D<float4> volumeFilteredRadianceY, Sampler3D<float2> volumeFilteredRadianceCoCg,
+  const VolumeArgs volumeArgs, float3 virtualFroxelUVW, uint froxelVolume, float3 viewDir)
+{
+  const float3 physicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(
+    virtualFroxelUVW, froxelVolume,
+    volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU, volumeArgs.inverseNumFroxelVolumes);
+
+  const SphericalHarmonic sh = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(
+    volumeFilteredRadianceY, volumeFilteredRadianceCoCg, physicalFroxelUVW);
+
+  // fogSunVisibilityGain scales only the anisotropic excess over isotropic SH.
+  const float3 isotropicRadiance = sh.evaluateHenyeyGreenstein(viewDir, 0.0f);
+  const float3 directionalRadiance = sh.evaluateHenyeyGreenstein(viewDir, volumeArgs.volumetricFogAnisotropy);
+  return isotropicRadiance
+    + (directionalRadiance - isotropicRadiance) * volumeArgs.fogSunVisibilityGain;
+}
+
+float3 evalUnoccludedReflectionInScatter(
+  const VolumeArgs volumeArgs, float3 viewDir, float3 isotropicInScatter, float3 originWorld,
+  float3 unoccludedSunRadiance, float3 unoccludedSunDirection)
+{
+  float3 lighting = isotropicInScatter;
+
+  const float sunLen2 = dot(unoccludedSunDirection, unoccludedSunDirection);
+  if (sunLen2 > 1e-8f)
+  {
+    const float3 sunDirN = unoccludedSunDirection * rsqrt(sunLen2);
+
+    // Medium T only; same sample distance as distantLightSampleArea. No geometric vis.
+    const float kDistantLightSampleDistance = 100000.0f;
+    const float3 sunPosition = originWorld + sunDirN * kDistantLightSampleDistance;
+    const float3 sunAtten = calcVolumetricAttenuation(
+      volumeArgs, none, false, kDistantLightSampleDistance, sunPosition, -sunDirN);
+
+    float3 sunY = unoccludedSunRadiance * sunAtten;
+    const float fireflyThreshold = volumeArgs.froxelFireflyFilteringLuminanceThreshold
+      * max(volumeArgs.fogSunFireflyScale, 1.0f);
+    sunY = fireflyFiltering(sunY, fireflyThreshold);
+
+    const float mu = dot(viewDir, sunDirN);
+    const float g = volumeArgs.volumetricFogAnisotropy;
+    // Linear SH HG (same as froxel evaluateHenyeyGreenstein), not analytic HG.
+    const float3 sunIso = sunY * rcp(fourPi);
+    const float3 sunDirEval = sunIso * (1.0f + 3.0f * g * mu);
+    lighting += sunIso + (sunDirEval - sunIso) * volumeArgs.fogSunVisibilityGain;
+  }
+
+  return lighting;
+}
+
+// In-view reflection samples may read the froxel cache. View-Z past froxelMaxDistance is allowed
+// (UVW.z saturates to the far slice). Reject behind the near plane, closer than the surface
+// (would resample camera→surface), or outside clip XY.
+bool reflectionCacheSampleValid(
+  float3 translatedWorldPosition, VolumeDefinitionCamera camera, float startPositiveViewZ)
+{
+  const bool invertViewZ = packedFlagGet(camera.flags, rightHandedFlag);
+  const float viewZSign = invertViewZ ? -1.0f : 1.0f;
+  const float viewZ = mul(camera.translatedWorldToView, float4(translatedWorldPosition, 1.0f)).z;
+  const float positiveViewZ = viewZ * viewZSign - camera.nearPlane;
+  if (positiveViewZ <= 0.0f || positiveViewZ + 1e-3f < startPositiveViewZ)
+  {
+    return false;
+  }
+
+  const float4 clip = mul(camera.translatedWorldToProjectionJittered, float4(translatedWorldPosition, 1.0f));
+  if (!(clip.w > 0.0f))
+  {
+    return false;
+  }
+
+  const float2 ndc = clip.xy / clip.w;
+  return abs(ndc.x) <= 1.0f && abs(ndc.y) <= 1.0f;
+}
+
+// outMeanInScatter: step-length weighted mean of cache in-scatter, or zero if every step used
+// uniformInScatter.
+// isReflectionSegment: linear t from the surface; cache only when reflectionCacheSampleValid
+// (do not clamp out-of-frustum UVW to an edge froxel).
 void integrateVolumetricNEE(
   inout RNG randomState,
   Sampler3D<float> volumeFilteredRadianceAge, Sampler3D<float4> volumeFilteredRadianceY, Sampler3D<float2> volumeFilteredRadianceCoCg,
@@ -72,7 +145,8 @@ void integrateVolumetricNEE(
   float3 startPosition, const float hitDistance, const float3 viewDir,
   inout float3 preintegratedRadiance, inout float3 accumulatedTransmittance,
   out float3 outMeanInScatter,
-  bool useUniformInScatter = false, float3 uniformInScatter = vec3(0.0f, 0.0f, 0.0f))
+  bool useUniformInScatter = false, float3 uniformInScatter = vec3(0.0f, 0.0f, 0.0f),
+  bool isReflectionSegment = false)
 {
   outMeanInScatter = vec3(0.0f, 0.0f, 0.0f);
 
@@ -144,6 +218,16 @@ void integrateVolumetricNEE(
   float3 previousTranslatedWorldPosition = startPositionTranslated;
   float3 lastInScatter = volumeArgs.multiScatteringEstimate;
 
+  float startPositiveViewZ = 0.0f;
+  if (isReflectionSegment)
+  {
+    const bool invertViewZ = packedFlagGet(camera.flags, rightHandedFlag);
+    const float startViewZSign = invertViewZ ? -1.0f : 1.0f;
+    startPositiveViewZ =
+      mul(camera.translatedWorldToView, float4(startPositionTranslated, 1.0f)).z * startViewZSign
+      - camera.nearPlane;
+  }
+
   // Step length weighted so a nonlinear step distribution does not bias the mean toward the near steps.
   float3 meanInScatterSum = vec3(0.0f, 0.0f, 0.0f);
   float meanInScatterWeight = 0.0f;
@@ -157,19 +241,27 @@ void integrateVolumetricNEE(
     // currently the step count is a fraction of the number of froxels for performance reasons).
     // Additionally, z+1 and numSteps+1 used here to find the position of the first step away from the origin.
     const float t = (float(z + 1) + getNextSampleBlueNoise(randomState)) / float(numSteps + 1);
-    const float nonlinearT = pow(t, volumeArgs.froxelDepthSliceDistributionExponent);
-    const vec3 currentTranslatedWorldPosition = startPositionTranslated + targetVector * nonlinearT;
+    // Camera rays use the froxel depth exponent. Reflection rays start at the surface, so t is linear.
+    const float stepT = isReflectionSegment
+      ? t
+      : pow(t, volumeArgs.froxelDepthSliceDistributionExponent);
+    const vec3 currentTranslatedWorldPosition = startPositionTranslated + targetVector * stepT;
     const float currentFroxelDistance = length(currentTranslatedWorldPosition);
 
     const float stepSize = length(currentTranslatedWorldPosition - previousTranslatedWorldPosition);
 
-    float3 virtualFroxelUVW = translatedWorldPositionToFroxelUVW(
+    const bool cacheSampleValid = !useUniformInScatter
+      && (!isReflectionSegment
+          || reflectionCacheSampleValid(currentTranslatedWorldPosition, camera, startPositiveViewZ));
+
+    float3 virtualFroxelUVW = float3(0.0f, 0.0f, 0.0f);
+    if (cacheSampleValid)
+    {
+      virtualFroxelUVW = translatedWorldPositionToFroxelUVW(
                                       camera.translatedWorldToView, camera.translatedWorldToProjectionJittered, packedFlagGet(camera.flags, rightHandedFlag),
                                       volumeArgs.froxelDepthSlices, volumeArgs.froxelDepthSliceDistributionExponent, volumeArgs.froxelMaxDistance, camera.nearPlane,
                                       currentTranslatedWorldPosition);
 
-    if (!useUniformInScatter)
-    {
       // Use the age as a guide for filtering, Larger footprint for early samples
 
       const float3 centerPhysicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(virtualFroxelUVW, currentFroxelVolume, volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU, volumeArgs.inverseNumFroxelVolumes);
@@ -205,24 +297,18 @@ void integrateVolumetricNEE(
 
     float3 accumulatedRadianceSample;
 
-    if (useUniformInScatter)
+    if (cacheSampleValid)
     {
-      accumulatedRadianceSample = uniformInScatter;
-    }
-    else
-    {
-      const float3 physicalFroxelUVW = virtualFroxelUVWToPhysicalFroxelUVW(virtualFroxelUVW, currentFroxelVolume, volumeArgs.minFilteredRadianceU, volumeArgs.maxFilteredRadianceU, volumeArgs.inverseNumFroxelVolumes);
-
-      const SphericalHarmonic sh = HarmonicsHelpers::loadFiltered3D<SphericalHarmonic>(volumeFilteredRadianceY, volumeFilteredRadianceCoCg, physicalFroxelUVW);
-
-      // fogSunVisibilityGain scales only the anisotropic excess over isotropic SH.
-      const float3 isotropicRadiance = sh.evaluateHenyeyGreenstein(viewDir, 0.0f);
-      const float3 directionalRadiance = sh.evaluateHenyeyGreenstein(viewDir, volumeArgs.volumetricFogAnisotropy);
-      accumulatedRadianceSample = isotropicRadiance
-        + (directionalRadiance - isotropicRadiance) * volumeArgs.fogSunVisibilityGain;
+      accumulatedRadianceSample = evalFroxelCacheInScatter(
+        volumeFilteredRadianceY, volumeFilteredRadianceCoCg,
+        volumeArgs, virtualFroxelUVW, currentFroxelVolume, viewDir);
 
       meanInScatterSum += accumulatedRadianceSample * stepSize;
       meanInScatterWeight += stepSize;
+    }
+    else
+    {
+      accumulatedRadianceSample = uniformInScatter;
     }
 
     float3 lighting = accumulatedRadianceSample + volumeArgs.multiScatteringEstimate;
