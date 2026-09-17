@@ -40,6 +40,28 @@ uint portalSpaceToVolumeHint(PortalSpace2BitsType portalSpace)
 // rays which miss geometry and go off into infinity or for distant light sources.
 // The origin position must be in the same translated world space as the volume camera passed in,
 // or world space if no camera is passed in.
+// Optical path of the exponential height falloff rho(h) = exp(-h / H) along a ray segment, h measured above
+// the planet surface. Composite Simpson's rule over 4 intervals: 5 density evaluations, fourth-order accurate
+// for this smooth integrand (the 8-interval trapezoid it replaces needed 9 evaluations for second order).
+float evalHeightFalloffOpticalPath(
+  const float3 origin, const float3 direction, const float tStart, const float segmentLength,
+  const float3 planetCenter, const float planetRadius, const float H)
+{
+  const float dt = segmentLength * 0.25f;
+  float weightedSum = 0.0f;
+
+  [unroll]
+  for (uint i = 0; i <= 4; ++i)
+  {
+    const float3 p = origin + direction * (tStart + dt * float(i));
+    const float rho = exp(-max(length(p - planetCenter) - planetRadius, 0.0f) / H);
+    const float weight = (i == 0 || i == 4) ? 1.0f : (((i & 1) != 0) ? 4.0f : 2.0f);
+    weightedSum += weight * rho;
+  }
+
+  return weightedSum * dt * (1.0f / 3.0f);
+}
+
 // The attenuation scalar may be used to scale the attenuation coefficient, typically for heterogeneous mediums.
 // Do note however this scalar applies as a constant across the entire length of the ray so small enough steps
 // must be taken to properly integrate a variable attenuation.
@@ -78,18 +100,7 @@ float3 calcVolumetricAttenuation(
       const float atmosphereRadius = sqrt(max(volumeArgs.atmosphereRadiusSquared, 0.0f));
       const float planetRadius = max(atmosphereRadius - volumeArgs.atmosphereHeight, 0.0f);
       const float H = volumeArgs.fogDensityScaleHeight;
-      const uint kSamples = 8;
-      const float dt = attenuationT / float(kSamples);
-      opticalPath = 0.0f;
-      float rhoPrev = exp(-max(length(origin - planetCenter) - planetRadius, 0.0f) / H);
-      [unroll]
-      for (uint i = 1; i <= kSamples; ++i)
-      {
-        const float3 p = origin + direction * (dt * float(i));
-        const float rho = exp(-max(length(p - planetCenter) - planetRadius, 0.0f) / H);
-        opticalPath += 0.5f * (rhoPrev + rho) * dt;
-        rhoPrev = rho;
-      }
+      opticalPath = evalHeightFalloffOpticalPath(origin, direction, 0.0f, attenuationT, planetCenter, planetRadius, H);
     }
 
     return evalBeerLambertAttenuation(volumeArgs.attenuationCoefficient * attenuationScalar, opticalPath);
@@ -254,7 +265,7 @@ float3 calcAtmosphereAttenuation(
     }
   }
 
-  // Height falloff: trapezoid mean of ρ(h)=exp(-h/H) along the atmospheric segment.
+  // Height falloff: optical path of ρ(h)=exp(-h/H) along the atmospheric segment.
   float opticalPath = attenuationT;
   if (volumeArgs.fogDensityScaleHeight > 0.0f && attenuationT > 0.0f)
   {
@@ -266,19 +277,7 @@ float3 calcAtmosphereAttenuation(
     {
       tEnter = atmosphereEntryHitT;
     }
-    const uint kSamples = 8;
-    const float dt = attenuationT / float(kSamples);
-    opticalPath = 0.0f;
-    float3 p = origin + direction * tEnter;
-    float rhoPrev = exp(-max(length(p - planetCenter) - planetRadius, 0.0f) / H);
-    [unroll]
-    for (uint i = 1; i <= kSamples; ++i)
-    {
-      p = origin + direction * (tEnter + dt * float(i));
-      const float rho = exp(-max(length(p - planetCenter) - planetRadius, 0.0f) / H);
-      opticalPath += 0.5f * (rhoPrev + rho) * dt;
-      rhoPrev = rho;
-    }
+    opticalPath = evalHeightFalloffOpticalPath(origin, direction, tEnter, attenuationT, planetCenter, planetRadius, H);
   }
 
   return evalBeerLambertAttenuation(volumeArgs.attenuationCoefficient * attenuationScalar, opticalPath);
