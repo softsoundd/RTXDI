@@ -106,7 +106,7 @@ bool evalNEE(
   {
     const float wupm = max(volumeArgs.worldUnitsPerMeter, 1e-6f);
     float altitudeKm = cb.atmosphereArgs.viewAltitude;
-    if (volumeArgs.enableAtmosphere != 0)
+    if (volumeArgs.enableAtmosphere)
     {
       const float atmR = sqrt(max(volumeArgs.atmosphereRadiusSquared, 0.0f));
       const float planetR = max(atmR - volumeArgs.atmosphereHeight, 0.0f);
@@ -323,12 +323,10 @@ void integrateVolume(
     }
   }
 
-  // Physical Atmosphere: sky-view LUT → froxel SH.
-  // Uniform Monte Carlo over the upper hemisphere with one visibility ray per sample, so interiors
-  // no longer inherit outdoor sky radiance. The SH accumulates the integral of incoming radiance
-  // over solid angle, so each sample carries radiance * (2pi / N); the resulting variance is
-  // absorbed by the froxel history blend further down.
-  // Phase is applied once in composite — do not bake HG here.
+  // Physical Atmosphere: the sky-view LUT into the froxel SH, by uniform hemisphere sampling with one
+  // visibility ray per sample so interiors do not see the outdoor sky. The SH integrates radiance over
+  // solid angle, so each sample carries radiance * (2pi / N); the froxel history blend absorbs the
+  // variance. The phase function is applied once, in composite, so no HG here.
   if (cb.skyMode == 1 && volumeArgs.skyAmbientStrength > 0.0f)
   {
     const bool isZUp = cb.isZUp != 0;
@@ -353,7 +351,7 @@ void integrateVolume(
       const float3 dirYUp = float3(hemisphereSample.x, hemisphereSample.z, hemisphereSample.y);
       const float3 dirWorld = isZUp ? float3(dirYUp.x, dirYUp.z, dirYUp.y) : dirYUp;
 
-      const vec3 skyVisibility = volumeArgs.skyAmbientVisibility != 0
+      const vec3 skyVisibility = volumeArgs.skyAmbientVisibility
         ? evalFroxelSkyVisibility(dirWorld, ray, minimalRayInteraction, volumeInteraction)
         : vec3(1.0f, 1.0f, 1.0f);
 
@@ -397,7 +395,7 @@ void integrateVolume(
     {
       const float wupm = max(volumeArgs.worldUnitsPerMeter, 1e-6f);
       float hWorld = 0.0f;
-      if (volumeArgs.enableAtmosphere != 0)
+      if (volumeArgs.enableAtmosphere)
       {
         const float atmR = sqrt(max(volumeArgs.atmosphereRadiusSquared, 0.0f));
         const float planetR = max(atmR - volumeArgs.atmosphereHeight, 0.0f);

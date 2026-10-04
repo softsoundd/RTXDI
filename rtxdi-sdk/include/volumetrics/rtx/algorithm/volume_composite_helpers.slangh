@@ -338,7 +338,7 @@ void integrateVolumetricNEE(
     lastInScatter = lighting;
     const float3 outScattering = scatterCoeff * density;
   
-    preintegratedRadiance += lighting * outScattering * accumulatedTransmittance * stepSize ;
+    preintegratedRadiance += lighting * outScattering * accumulatedTransmittance * stepSize;
     // Not via calcVolumetricAttenuation: density already carries the exp(-h/H) falloff, which that function
     // would apply a second time, leaving extinction quadratic in density while the in-scatter above is
     // linear in it.
