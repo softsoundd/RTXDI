@@ -24,8 +24,20 @@
 #include "rtx/algorithm/lighting.slangh"
 #include "rtx/algorithm/rtxdi/rtxdi.slangh"
 #include "rtx/pass/atmosphere/atmosphere_common.slangh"
+#include "rtx/pass/clouds/cloud_common.slangh"
 
 // Volume Integrate Helper Functions
+
+// Cloud transmittance of the atmosphere's sun at a froxel, for shadows of the cloud layer in the fog
+// (crepuscular rays beneath a broken deck). 1 without clouds or with their air shadows off.
+float evalFroxelCloudSunTransmittance(vec3 worldPosition)
+{
+  if (cb.cloudArgs.enabled == 0 || (cb.cloudArgs.flags & CLOUD_FLAG_FOG_SHADOWS) == 0)
+  {
+    return 1.0f;
+  }
+  return cloudSunTransmittance(CloudSunGrid, CloudShadowMap, CloudSampler, worldPosition, cb.cloudArgs, cb.atmosphereArgs);
+}
 
 // Transmittance from a froxel toward the sky along dirWorld, zero when occluded. Without this the
 // sky-view LUT hemisphere is injected into every froxel regardless of geometry, which leaks outdoor
@@ -124,6 +136,7 @@ bool evalNEE(
     const vec3 T_0 = getTransmittanceToSunAtAltitude(cb.atmosphereArgs.viewAltitude, AtmosphereTransmittanceLut, cb.atmosphereArgs);
     // Clamp so near-twilight ground T≈0 cannot blow up elevated samples.
     lightRadiance *= clamp(T_h / max(T_0, vec3(1e-6f)), vec3(0.0f), vec3(8.0f));
+    lightRadiance *= evalFroxelCloudSunTransmittance(volumeInteraction.position);
   }
   
   if (volumeArgs.enable)
@@ -357,8 +370,10 @@ void integrateVolume(
 
       skyOpenness += (skyVisibility.x + skyVisibility.y + skyVisibility.z) * (1.0f / 3.0f);
 
-      const vec3 skyRadiance =
-        sampleSkyAmbientForVolume(dirYUp, cb.atmosphereArgs, AtmosphereSkyViewLut) * skyVisibility;
+      // The sky through the cloud layer, from the dome.
+      const vec3 skyRadiance = cloudCompositeOverSky(
+        cloudSampleDome(CloudDome, CloudSampler, dirYUp, cb.cloudArgs),
+        sampleSkyAmbientForVolume(dirYUp, cb.atmosphereArgs, AtmosphereSkyViewLut)) * skyVisibility;
       visibleSkyMean += skyRadiance;
 
       if (any(skyRadiance > 0.0f))
@@ -417,7 +432,8 @@ void integrateVolume(
       // Reuse sky openness: indoors the sun cannot reach the ground under the froxel either.
       const vec3 bounce = cb.atmosphereArgs.sunIlluminance * T * cb.atmosphereArgs.sunRayBrightness
                         * groundAlbedo * (1.0f / 3.14159265f)
-                        * volumeArgs.groundBounceScale * heightFade * twilightFade * skyOpenness;
+                        * volumeArgs.groundBounceScale * heightFade * twilightFade * skyOpenness
+                        * evalFroxelCloudSunTransmittance(volumeInteraction.position);
       radianceSH.addRadiance(fireflyFiltering(bounce, fireflyThreshold), -zenithWorld);
     }
   }
