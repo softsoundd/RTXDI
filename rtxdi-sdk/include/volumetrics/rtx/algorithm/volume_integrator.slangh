@@ -32,7 +32,7 @@
 // (crepuscular rays beneath a broken deck). 1 without clouds or with their air shadows off.
 float evalFroxelCloudSunTransmittance(vec3 worldPosition)
 {
-  if (cb.cloudArgs.enabled == 0 || (cb.cloudArgs.flags & CLOUD_FLAG_FOG_SHADOWS) == 0)
+  if (!cb.cloudArgs.enabled || (cb.cloudArgs.flags & CLOUD_FLAG_FOG_SHADOWS) == 0)
   {
     return 1.0f;
   }
